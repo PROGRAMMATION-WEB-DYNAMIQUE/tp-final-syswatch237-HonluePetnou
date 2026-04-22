@@ -1,17 +1,18 @@
-// src/main.rs
+// src/main.rs — SysWatch : Moniteur Système en Réseau
+
 use chrono::Local;
 use std::fmt;
-use sysinfo::{System, Process};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::fs::OpenOptions;
+use sysinfo::System;
 
-const AUTH_TOKEN: &str = "ENSPD2026";
-
-// --- Types métier ---
+// ============================================================
+// ÉTAPE 1 — Modélisation des données
+// ============================================================
 
 #[derive(Debug, Clone)]
 struct CpuInfo {
@@ -21,9 +22,9 @@ struct CpuInfo {
 
 #[derive(Debug, Clone)]
 struct MemInfo {
-    total_mb: u64,
-    used_mb: u64,
-    free_mb: u64,
+    total_kb: u64,
+    used_kb: u64,
+    free_kb: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -31,18 +32,16 @@ struct ProcessInfo {
     pid: u32,
     name: String,
     cpu_usage: f32,
-    memory_mb: u64,
+    mem_kb: u64,
 }
 
 #[derive(Debug, Clone)]
 struct SystemSnapshot {
-    timestamp: String,
     cpu: CpuInfo,
-    memory: MemInfo,
-    top_processes: Vec<ProcessInfo>,
+    mem: MemInfo,
+    processes: Vec<ProcessInfo>,
+    timestamp: String,
 }
-
-// --- Affichage humain (Trait Display) ---
 
 impl fmt::Display for CpuInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,10 +51,13 @@ impl fmt::Display for CpuInfo {
 
 impl fmt::Display for MemInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total_mb = self.total_kb / 1024;
+        let used_mb  = self.used_kb  / 1024;
+        let free_mb  = self.free_kb  / 1024;
         write!(
             f,
-            "MEM: {}MB utilisés / {}MB total ({} MB libres)",
-            self.used_mb, self.total_mb, self.free_mb
+            "MEM: {} MB utilisés / {} MB total ({} MB libres)",
+            used_mb, total_mb, free_mb
         )
     }
 }
@@ -64,393 +66,333 @@ impl fmt::Display for ProcessInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "  [{:>6}] {:<25} CPU:{:>5.1}%  MEM:{:>5}MB",
-            self.pid, self.name, self.cpu_usage, self.memory_mb
+            "  [{:>6}] {:<25} CPU:{:>5.1}%  MEM:{:>5} MB",
+            self.pid, self.name, self.cpu_usage, self.mem_kb / 1024
         )
     }
 }
 
 impl fmt::Display for SystemSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== SysWatch — {} ===", self.timestamp)?;
-        writeln!(f, "{}", self.cpu)?;
-        writeln!(f, "{}", self.memory)?;
-        writeln!(f, "--- Top Processus ---")?;
-        for p in &self.top_processes {
-            writeln!(f, "{}", p)?;
+        writeln!(f, "┌─────────────────────────────────────────────┐")?;
+        writeln!(f, "│  SysWatch — {}  │", self.timestamp)?;
+        writeln!(f, "├─────────────────────────────────────────────┤")?;
+        writeln!(f, "│  {}                   ", self.cpu)?;
+        writeln!(f, "│  {}   ", self.mem)?;
+        writeln!(f, "├─────────────────────────────────────────────┤")?;
+        writeln!(f, "│  Top Processus (par CPU)                    │")?;
+        for p in &self.processes {
+            writeln!(f, "│{}", p)?;
         }
-        write!(f, "=====================")
+        write!(f, "└─────────────────────────────────────────────┘")
     }
 }
 
-// --- Erreurs custom (exo 2) --- Etape 2: Gestion d'erreurs avec un enum dédié
+// ============================================================
+// ÉTAPE 2 — Collecte réelle et gestion d'erreurs
+// ============================================================
 
 #[derive(Debug)]
 enum SysWatchError {
-    CollectionFailed(String),
+    CollectionError(String),
 }
 
 impl fmt::Display for SysWatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SysWatchError::CollectionFailed(msg) => write!(f, "Erreur collecte: {}", msg),
+            SysWatchError::CollectionError(msg) => write!(f, "Erreur collecte: {}", msg),
         }
     }
 }
 
 impl std::error::Error for SysWatchError {}
 
-// --- Collecte système ---
-
 fn collect_snapshot() -> Result<SystemSnapshot, SysWatchError> {
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    // Petite pause pour que sysinfo ait des valeurs CPU non nulles
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Double refresh pour des valeurs CPU stables
+    thread::sleep(Duration::from_millis(300));
     sys.refresh_all();
 
-    let cpu_usage = sys.global_cpu_info().cpu_usage();
     let core_count = sys.cpus().len();
-
     if core_count == 0 {
-        return Err(SysWatchError::CollectionFailed("Aucun CPU détecté".to_string()));
+        return Err(SysWatchError::CollectionError("Aucun CPU détecté".to_string()));
     }
 
-    let total_mb = sys.total_memory() / 1024 / 1024;
-    let used_mb = sys.used_memory() / 1024 / 1024;
-    let free_mb = sys.free_memory() / 1024 / 1024;
+    let cpu = CpuInfo {
+        usage_percent: sys.global_cpu_info().cpu_usage(),
+        core_count,
+    };
 
-    // Top 5 processus par consommation CPU
+    let mem = MemInfo {
+        total_kb: sys.total_memory() / 1024,
+        used_kb:  sys.used_memory()  / 1024,
+        free_kb:  sys.free_memory()  / 1024,
+    };
+
     let mut processes: Vec<ProcessInfo> = sys
         .processes()
         .values()
-        .map(|p: &Process| ProcessInfo {
-            pid: p.pid().as_u32(),
-            name: p.name().to_string(),
+        .map(|p| ProcessInfo {
+            pid:       p.pid().as_u32(),
+            name:      p.name().to_string(),
             cpu_usage: p.cpu_usage(),
-            memory_mb: p.memory() / 1024 / 1024,
+            mem_kb:    p.memory() / 1024,
         })
         .collect();
 
-    processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap());
+    // Tri décroissant par CPU, top 5
+    processes.sort_by(|a, b| {
+        b.cpu_usage
+            .partial_cmp(&a.cpu_usage)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     processes.truncate(5);
 
-    Ok(SystemSnapshot {
-        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        cpu: CpuInfo { usage_percent: cpu_usage, core_count },
-        memory: MemInfo { total_mb, used_mb, free_mb },
-        top_processes: processes,
-    })
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    Ok(SystemSnapshot { cpu, mem, processes, timestamp })
 }
 
-//// Formatage responses (Exo 3) — Simuler une interface textuelle simple
+// ============================================================
+// ÉTAPE 3 — Formatage des réponses réseau
+// ============================================================
+
+/// Construit une barre ASCII de `width` caractères proportionnelle à `percent` (0–100).
+/// Exemple : 75 % sur 20 chars → ████████████████░░░░
+fn ascii_bar(percent: f32, width: usize) -> String {
+    let pct    = percent.clamp(0.0, 100.0);
+    let filled = ((pct / 100.0) * width as f32).round() as usize;
+    (0..width).map(|i| if i < filled { '█' } else { '░' }).collect()
+}
 
 fn format_response(snapshot: &SystemSnapshot, command: &str) -> String {
-    let cmd = command.trim().to_lowercase();
+    let cmd = command.trim().to_ascii_lowercase();
 
     match cmd.as_str() {
-        "cpu" => format!(
-            "[CPU]\n{}\n\nHistorique:\n{}\n",
-            snapshot.cpu,
-            // Itérateur : simuler une barre de progression ASCII
-            (0..10)
-                .map(|i| {
-                    let threshold = (snapshot.cpu.usage_percent / 10.0) as usize;
-                    if i < threshold { "█" } else { "░" }
-                })
-                .collect::<Vec<_>>()
-                .join("") + &format!(" {:.1}%", snapshot.cpu.usage_percent)
-        ),
+        "cpu" => {
+            let bar = ascii_bar(snapshot.cpu.usage_percent, 20);
+            format!(
+                "[CPU]\n{}\n[{}] {:.1}%\n",
+                snapshot.cpu, bar, snapshot.cpu.usage_percent
+            )
+        }
 
         "mem" => {
-            let percent = (snapshot.memory.used_mb as f64 / snapshot.memory.total_mb as f64) * 100.0;
-            let bar: String = (0..20)
-                .map(|i| if i < (percent / 5.0) as usize { '█' } else { '░' })
-                .collect();
+            let percent = if snapshot.mem.total_kb == 0 {
+                0.0_f32
+            } else {
+                (snapshot.mem.used_kb as f32 / snapshot.mem.total_kb as f32) * 100.0
+            };
+            let bar = ascii_bar(percent, 20);
             format!(
-                "[MÉMOIRE]\n{}\n[{}] {:.1}%\n",
-                snapshot.memory, bar, percent
+                "[MEM]\n{}\n[{}] {:.1}%\n",
+                snapshot.mem, bar, percent
             )
-        },
+        }
 
-        "ps" | "procs" => {
-            let lines: String = snapshot
-                .top_processes
+        "ps" => {
+            let body: String = snapshot
+                .processes
                 .iter()
                 .enumerate()
-                .map(|(i, p)| format!("{}. {}", i + 1, p))
+                .map(|(i, p)| format!("{:>2}. {}", i + 1, p))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("[PROCESSUS — Top {}]\n{}\n", snapshot.top_processes.len(), lines)
-        },
-
-        "shutdown" => {
-            // Windows
-            std::process::Command::new("shutdown")
-                .args(["/s", "/t", "5"])
-                .spawn()
-                .ok();
-            "SHUTDOWN programmé dans 5 secondes.\n".to_string()
+            format!("[PS — Top {} processus]\n{}\n", snapshot.processes.len(), body)
         }
 
-        "reboot" => {
-            std::process::Command::new("shutdown")
-                .args(["/r", "/t", "5"])
-                .spawn()
-                .ok();
-            "REBOOT programmé dans 5 secondes.\n".to_string()
+        "all" => {
+            format!(
+                "{}\n{}\n{}",
+                format_response(snapshot, "cpu"),
+                format_response(snapshot, "mem"),
+                format_response(snapshot, "ps")
+            )
         }
-
-        "abort" => {
-            // Annuler un shutdown/reboot en cours
-            std::process::Command::new("shutdown")
-                .args(["/a"])
-                .spawn()
-                .ok();
-            "Extinction annulée.\n".to_string()
-        }
-
-        _ if cmd.starts_with("msg ") => {
-            // Afficher un message dans le terminal de l'étudiant
-            // msg Bonjour tout le monde !
-            let text = &cmd[4..];
-            println!("\n╔══════════════════════════════════════╗");
-            println!("║  MESSAGE DU PROFESSEUR               ║");
-            println!("║  {}{}║", text, " ".repeat(38usize.saturating_sub(text.len())));
-            println!("╚══════════════════════════════════════╝\n");
-            format!("Message affiché sur la machine cible.\n")
-        }
-
-        _ if cmd.starts_with("install ") => {
-            // install <nom-du-package-winget>
-            // ex: install git.git
-            let package = cmd[8..].trim().to_string();
-            std::thread::spawn(move || {
-                std::process::Command::new("winget")
-                    .args(["install", "--silent", &package])
-                    .status()
-                    .ok();
-            });
-            format!("Installation de '{}' lancée en arrière-plan.\n", &cmd[8..])
-        }
-
-        "all" | "" => format!("{}\n", snapshot),
 
         "help" => concat!(
-            "Commandes disponibles:\n",
-            "  cpu   — Usage CPU + barre\n",
-            "  mem   — Mémoire RAM\n",
-            "  ps    — Top processus\n",
-            "  all   — Vue complète\n",
+            "Commandes disponibles :\n",
+            "  cpu   — Usage CPU + barre ASCII\n",
+            "  mem   — Mémoire RAM + barre ASCII\n",
+            "  ps    — Top 5 processus par CPU\n",
+            "  all   — Vue complète (cpu + mem + ps)\n",
             "  help  — Cette aide\n",
             "  quit  — Fermer la connexion\n",
         ).to_string(),
 
-        "quit" | "exit" => "BYE\n".to_string(),
+        "quit" => "Au revoir ! Connexion fermée.\n".to_string(),
 
-        _ => format!("Commande inconnue: '{}'. Tape 'help'.\n", command.trim()),
+        _ => format!(
+            "Commande inconnue : '{}'. Tape 'help' pour la liste des commandes.\n",
+            command.trim()
+        ),
     }
 }
 
+// ============================================================
+// ÉTAPE 4 — Serveur TCP multi-threadé
+// ============================================================
 
-// // Exo 4: Serveur TCP multithreadé —
-// fn handle_client(mut stream: TcpStream, snapshot: Arc<Mutex<SystemSnapshot>>) {
-//     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or("inconnu".to_string());
-//     println!("[+] Connexion de {}", peer);
-//     log_event(&format!("[+] Connexion de {}", peer));
-
-//     // Message de bienvenue
-//     let welcome = concat!(
-//         "╔══════════════════════════════╗\n",
-//         "║   SysWatch v1.0 — ENSPD      ║\n",
-//         "║   Tape 'help' pour commencer ║\n",
-//         "╚══════════════════════════════╝\n",
-//         "> "
-//     );
-//     let _ = stream.write_all(welcome.as_bytes());
-
-//     let reader = BufReader::new(stream.try_clone().expect("Clone stream échoué"));
-
-//     for line in reader.lines() {
-//         match line {
-//             Ok(cmd) => {
-//                 let cmd = cmd.trim().to_string();
-//                 println!("[{}] commande: '{}'", peer, cmd);
-//                 log_event(&format!("[{}] commande: '{}'", peer, cmd));
-
-//                 if cmd.eq_ignore_ascii_case("quit") || cmd.eq_ignore_ascii_case("exit") {
-//                     let _ = stream.write_all(b"Au revoir!\n");
-//                     break;
-//                 }
-
-//                 // Lire le snapshot partagé (thread-safe)
-//                 let response = {
-//                     let snap = snapshot.lock().unwrap();
-//                     format_response(&snap, &cmd)
-//                 };
-
-//                 let _ = stream.write_all(response.as_bytes());
-//                 let _ = stream.write_all(b"> "); // prompt
-//             }
-//             Err(_) => break,
-//         }
-//     }
-
-//     println!("[-] Déconnexion de {}", peer);
-//     log_event(&format!("[-] Déconnexion de {}", peer));
-// }
-
-fn snapshot_refresher(snapshot: Arc<Mutex<SystemSnapshot>>) {
+fn snapshot_refresher(shared: Arc<Mutex<SystemSnapshot>>) {
     loop {
         thread::sleep(Duration::from_secs(5));
         match collect_snapshot() {
             Ok(new_snap) => {
-                let mut snap = snapshot.lock().unwrap();
-                *snap = new_snap;
-                println!("[refresh] Métriques mises à jour");
+                if let Ok(mut snap) = shared.lock() {
+                    *snap = new_snap;
+                }
             }
             Err(e) => eprintln!("[refresh] Erreur: {}", e),
         }
     }
 }
 
-
-fn log_event(message: &str) {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let line = format!("[{}] {}\n", timestamp, message);
-
-    // Écriture console
-    print!("{}", line);
-
-    // Écriture fichier — on ignore l'erreur silencieusement (best-effort)
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("syswatch.log")
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
-
-
-fn handle_client(mut stream: TcpStream, snapshot: Arc<Mutex<SystemSnapshot>>) {
-    let peer = stream.peer_addr()
+fn handle_client(
+    mut stream: TcpStream,
+    shared: Arc<Mutex<SystemSnapshot>>,
+    log_file: Arc<Mutex<File>>,
+) {
+    let peer = stream
+        .peer_addr()
         .map(|a| a.to_string())
-        .unwrap_or("inconnu".to_string());
-    log_event(&format!("[+] Connexion de {}", peer));
+        .unwrap_or_else(|_| "inconnu".to_string());
 
-    // Étape 1 : demander le token
-    let _ = stream.write_all(b"TOKEN: ");
-    let mut reader = BufReader::new(stream.try_clone().expect("Clone failed"));
-    let mut token_line = String::new();
-    if reader.read_line(&mut token_line).is_err() || token_line.trim() != AUTH_TOKEN {
-        let _ = stream.write_all(b"UNAUTHORIZED\n");
-        log_event(&format!("[!] Accès refusé depuis {}", peer));
-        return;
-    }
-    let _ = stream.write_all(b"OK\n");
-    log_event(&format!("[✓] Authentifié: {}", peer));
+    log_event(&log_file, &format!("CONNECT {}", peer));
+    println!("[INFO] Client connecté : {}", peer);
 
-    // Boucle de commandes
+    // Message de bienvenue
+    let welcome = concat!(
+        "╔══════════════════════════════╗\n",
+        "║   SysWatch v1.0 — ENSPD      ║\n",
+        "║   Tape 'help' pour commencer ║\n",
+        "╚══════════════════════════════╝\n",
+        "> "
+    );
+    let _ = stream.write_all(welcome.as_bytes());
+
+    // Clone du stream pour le BufReader
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[{}] Impossible de cloner le stream: {}", peer, e);
+            return;
+        }
+    };
+    let reader = BufReader::new(reader_stream);
+
     for line in reader.lines() {
         match line {
             Ok(cmd) => {
                 let cmd = cmd.trim().to_string();
-                log_event(&format!("[{}] commande: '{}'", peer, cmd));
+                if cmd.is_empty() {
+                    let _ = stream.write_all(b"> ");
+                    continue;
+                }
+
+                log_event(&log_file, &format!("CMD {} > {}", peer, cmd));
 
                 if cmd.eq_ignore_ascii_case("quit") {
-                    let _ = stream.write_all(b"BYE\n");
+                    let response = format_response(
+                        &shared.lock().unwrap_or_else(|e| e.into_inner()),
+                        "quit",
+                    );
+                    let _ = stream.write_all(response.as_bytes());
                     break;
                 }
 
-                let response = {
-                    let snap = snapshot.lock().unwrap();
-                    format_response(&snap, &cmd)
+                let response = match shared.lock() {
+                    Ok(snap) => format_response(&snap, &cmd),
+                    Err(_)   => "Erreur interne: verrou indisponible\n".to_string(),
                 };
 
                 let _ = stream.write_all(response.as_bytes());
-                let _ = stream.write_all(b"\nEND\n"); // marqueur fin de réponse
+                let _ = stream.write_all(b"\n> ");
             }
             Err(_) => break,
         }
     }
 
-    log_event(&format!("[-] Déconnexion de {}", peer));
+    log_event(&log_file, &format!("DISCONNECT {}", peer));
+    println!("[INFO] Client déconnecté : {}", peer);
 }
 
+// ============================================================
+// ÉTAPE 5 (BONUS) — Journalisation fichier
+// ============================================================
 
-// Main Exo 1: Types métier et affichage — Etape 3: Affichage humain avec le trait Display
-// fn main() {
-//     // Test d'affichage — données fictives pour valider les types
-//     let snapshot = SystemSnapshot {
-//         timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-//         cpu: CpuInfo { usage_percent: 42.5, core_count: 8 },
-//         memory: MemInfo { total_mb: 16384, used_mb: 8192, free_mb: 8192 },
-//         top_processes: vec![
-//             ProcessInfo { pid: 1234, name: "code.exe".to_string(), cpu_usage: 12.3, memory_mb: 512 },
-//             ProcessInfo { pid: 5678, name: "chrome.exe".to_string(), cpu_usage: 8.1, memory_mb: 1024 },
-//         ],
-//     };
+/// Écrit une entrée horodatée dans le fichier de log partagé.
+/// Format : [2025-06-01 14:32:01] CONNECT 127.0.0.1:54321
+fn log_event(log_file: &Arc<Mutex<File>>, message: &str) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = format!("[{}] {}\n", timestamp, message);
 
-//     println!("{}", snapshot);
-// }
+    if let Ok(mut file) = log_file.lock() {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
 
+fn open_log_file() -> Result<File, std::io::Error> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("syswatch.log")
+}
 
-// Main Exo 2: Gestion d'erreurs — Etape 1: Utilisation de Result dans la fonction de collecte et affichage complet
-
-// fn main() {
-//     match collect_snapshot() {
-//         Ok(snapshot) => println!("{}", snapshot),
-//         Err(e) => eprintln!("ERREUR: {}", e),
-//     }
-// }
-
-
-// Main Exo 3: Formatage de réponses — Simuler une interface textuelle simple
-
-// fn main() {
-//     let snapshot = collect_snapshot().expect("Collecte échouée");
-//     println!("{}", format_response(&snapshot, "cpu"));
-//     println!("{}", format_response(&snapshot, "mem"));
-//     println!("{}", format_response(&snapshot, "ps"));
-//     println!("{}", format_response(&snapshot, "help"));
-// }
-
-// Main Exo 4: Serveur TCP multithreadé — Etape 1: Lancement d'un serveur TCP basique
-
+// ============================================================
 
 fn main() {
-    println!("SysWatch démarrage...");
+    println!("[SysWatch] Serveur démarré sur le port 7878");
+
+    // Ouvrir le fichier de log (partagé entre tous les threads)
+    let log_file = match open_log_file() {
+        Ok(f) => Arc::new(Mutex::new(f)),
+        Err(e) => {
+            eprintln!("[SysWatch] Impossible d'ouvrir syswatch.log: {}", e);
+            return;
+        }
+    };
 
     // Collecte initiale
-    let initial = collect_snapshot().expect("Impossible de collecter les métriques initiales");
-    println!("Métriques initiales OK:\n{}", initial);
+    let initial = match collect_snapshot() {
+        Ok(snap) => snap,
+        Err(e) => {
+            eprintln!("[SysWatch] Erreur collecte initiale: {}", e);
+            return;
+        }
+    };
+    println!("Snapshot initial:\n{}\n", initial);
 
     // Snapshot partagé entre tous les threads
     let shared_snapshot = Arc::new(Mutex::new(initial));
 
-    // Thread de rafraîchissement automatique toutes les 5s
+    // Thread de rafraîchissement (toutes les 5 secondes) — démarre AVANT le listener
     {
         let snap_clone = Arc::clone(&shared_snapshot);
         thread::spawn(move || snapshot_refresher(snap_clone));
     }
 
     // Démarrage du serveur TCP
-    let listener = TcpListener::bind("0.0.0.0:7878").expect("Impossible de bind le port 7878");
-    println!("Serveur en écoute sur port 7878...");
-    println!("Connecte-toi avec: telnet localhost 7878");
-    println!("  ou: nc localhost 7878 (WSL/Git Bash)");
-    println!("  ou: Test-NetConnection localhost -Port 7878 (PowerShell - test seulement)");
-    println!("Ctrl+C pour arrêter.\n");
+    let listener = match TcpListener::bind("0.0.0.0:7878") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[SysWatch] Impossible de bind le port 7878: {}", e);
+            return;
+        }
+    };
+
+    println!("Connecte-toi avec : telnet localhost 7878");
+    println!("            ou   : nc localhost 7878\n");
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let snap_clone = Arc::clone(&shared_snapshot);
-                thread::spawn(move || handle_client(stream, snap_clone));
+                let log_clone  = Arc::clone(&log_file);
+                thread::spawn(move || handle_client(stream, snap_clone, log_clone));
             }
-            Err(e) => eprintln!("Erreur connexion entrante: {}", e),
+            Err(e) => eprintln!("[SysWatch] Erreur connexion entrante: {}", e),
         }
     }
 }
